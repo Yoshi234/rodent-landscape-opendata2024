@@ -1,0 +1,1492 @@
+
+---
+title: "New York Rodent Inspections and Analysis at the Zip Code Level"
+author: Joshua Lee
+format: 
+    pdf:
+        toc: true
+        number-sections: true
+        colorlinks: true
+---
+
+* Author: Joshua Lee
+* Submission Date: 2024-03-05 / 11:59pm
+
+# Midterm Project
+
+Rodents in NYC [Rodents in NYC](https://en.wikipedia.org/wiki/Rats_in_New_York_City) 
+are widespread, as they are in many densely populated areas. As of 
+October 2023, NYC dropped from the 2nd to the 3rd places in the annual
+[“rattiest city” list](https://www.orkin.com/press-room/top-rodent-infested-cities-2023#)
+released by a pest control company. Rat sightings in NYC was analyzed by 
+Dr. Michael Walsh in a [2014 PeerJ 
+article](https://peerj.com/articles/533/). 
+We investigate this problem from a different angle with the [NYC 
+Rodent Inspection data](https://data.cityofnewyork.us/Health/Rodent-Inspection/p937-wjvj/about_data),
+provided by the Department of Health and Mental 
+Hygiene (DOHMH). Download the 2022-2023 data by filtering the 
+INSPECTION_DATE to between 11:59:59 pm of 12/31/2021 and 12:00:00 am of 
+01/01/2024 and INSPECTION_TYPE is either Initial or Compliance (which 
+should be about 108 MB). Read the meta data information to understand 
+the data.
+
+## Data Cleaning
+
+**Problem Statement**
+
++ There are two zipcode columns: `ZIP_CODE` and `Zipcodes`. Which one 
+  represent the zipcode of the inspection site? Comment on the data 
+  dictionary
++ Summarize the missing information. Are their missing values that 
+  can be filled using other columns? Fill
++ Are their redundant information in the data? Try storing the data 
+  using `arrow` and comment on the efficiency gain. 
++ Are there invalid zipcode or borough? Justify and clean them up if
+  yes.
+
+Before performing data cleaning, we need to import all of the 
+packages necessary for the processes which will follow: 
+
+```{python}
+# data manipulation packages
+import pandas as pd
+import numpy as np 
+
+# package for obtaining data auxilliary to the zip code data
+from uszipcode import SearchEngine, SimpleZipcode, ComprehensiveZipcode
+
+# logistic modeling and model training with Scikit-learn
+from sklearn.linear_model import LogisticRegression, LassoCV, Lasso
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import f1_score, r2_score, mean_squared_error
+from sklearn.preprocessing import OneHotEncoder
+
+# import graphing packages
+from plotnine import * 
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import descartes
+from shapely.geometry import Point, Polygon
+
+# use statsmodels for vif calculation
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.formula.api as smf
+
+# import statistical packages
+from scipy.stats import chi2_contingency
+
+# set code to ignore all warnings generated
+import warnings
+warnings.filterwarnings("ignore")
+
+# import datetime package for datetime comparisons
+from datetime import datetime
+```
+
+Once we have imported all of the python packages necessary
+for this analysis, we should examine the data dictionary 
+provided by the 311 requests rodent inspection data. See 
+[New York Open Data](https://data.cityofnewyork.us/Health/Rodent-Inspection/p937-wjvj/about_data)
+for more information. 
+
+According to the website description, there are 25 columns included
+in this data, and approximately 2.5 million records (tuples). 
+However, we have queried the data for records with an inspection date
+ranging from December 31st, 2021 11:59:59 PM to January 1st, 2024
+12:00:00 AM, 
+and an inspection type of either "compliance" or "initial".
+This shrinks the data we are handling from 2.5 million records to 
+407,186. 
+
+Now that we have obtained the data, we can examine the data dictionary
+more thoroughly. The 25 columns (variables) contained within the 
+dataset are as follows: 
+
++ `INSPECTION_TYPE`: This can be used in conjunction with
+  `JOBTICKETORWORKORDERID` to *uniquely identify records* in the 
+  dataset. (these attributes make up a composite key for the dataset). 
+  Additionally, we can see that "Initial" inspections (which we selected 
+  for) are those conducted in response to a 311 complaint (as we saw
+  from the rodent complaints data) **OR** a proactive inspection. 
+  A "Compliance" inspection is conducted ONLY if the initial inspection
+  failed. 
++ `JOB_ID`: is an internal identifier for the DOHMH (for identifying 
+  jobs)
++ `JOB_PROGRESS` : an integer indicating the progress made on a
+  311 requests job which includes multiple jobs, and the order in which 
+  they took place. 
++ `BBL` : The "Borough, Block, and Lot code" - used as a unique 
+  identifier of NYC tax lots. These should be treated as categorical
+  variables, which may be grouped. It may be worthwhile to use the 
+  PLUTO dataset from the department of city plannings to map 
+  the new york tax lots. This is important because inspections
+  are conducted at the **Tax Lot Level**
++ `BOROCODE`: Code assigned to NYC borough, first digit in the `BBL` 
+  value - this data may be redundant
++ `BLOCK`: The block number for the inspected tax lot (block numbers
+  can repeat for different boroughs - so the "Bronx" and "Manhattan" 
+  may both have a block with the same value)
++ `LOT`: lot number of the inspected tax lot. Again, as with blocks, the
+  lot number *can repeat* for different blocks, but the lot numbers
+  should be unique within a given block.
++ `HOUSENUMBER`: Address of building on the taxlot inspected
++ `ZIPCODE`: Postal zipcode of the taxlot inspected
++ `X_COORDINATE`: X coordinate of inspected taxlot in NY state plane 
+  Long Island coordinate system
++ `Y_COORDINATE`: Y coordinate of inspected taxlot in NY state plane
+  Long Island coordinate system
++ `LATITUDE`: standardized latitude measure in decimal degrees for 
+  inspected taxlot
++ `LONGITUDE`: standardized longitude measure in decimal degrees for 
+  inspected taxlot
++ `BOROUGH`: Name of the NYC borough where inspection occurred
++ `INSPECTION_DATE`: Date of the inspection (should be between 
+  December 31st, 2021, and January 1st, 2024)
++ `RESULT`: The result of the inspection
+  + `ARS`: Active Rat Signs
+    + fresh tracks
+    + fresh droppings
+    + active burrows
+    + active runways and rub marks
+    + fresh gnawing marks
+    + **live rats**
+  + `Problem Conditions`
+    + garbage (poor containerization of food waste and feeding of rats)
+    + harborage (clutter and dense vegetation promoting rat nesting)
+    + mice
++ `APPROVED_DATE`: Date inspection is approved by supervisor at DOHMH
+
+Let's also take a look at the data to see which variables are present. 
+After all, the metadata (data about the data) was only last updated in 
+July of 2023. 
+
+```{python}
+# load the data as csv (initial)
+inspect_dat = pd.read_csv("data/rodent_inspection_2022-2023.csv")
+
+# examine the columns of the first 2 rows of the data (transposed)
+inspect_dat.head(1).T
+```
+
+It seems that there are actually several variables in the dataset which 
+were not accounted for in the data dictionary. We can make reasonable 
+conjecture about their meaning and use though. The extra variables 
+in question are as follows:
+
++ `LOCATION`: This is an (x,y) tuple (stored as a string) of the 
+  latitude and longitude information provided
++ `COMMUNITY BOARD`: Still not sure what this is. However, it was 
+  present in the 311 requests dataset, so we can use that data 
+  dictionary as a reference. According to that dictionary, the 
+  `COMMUNITY BOARD` variable indicates which of the 
+  **59 community boards** is the local representative body. The 
+  primary responsibility of the community board is to advise the 
+  community on *zoning*, *service delivery* and *land use*. They 
+  are also involved in community advocacy projects.
++ `COUNCIL DISTRICT`: There isn't any additional information provided 
+  about this variable in the data dictionary of either dataset. However, 
+  a quick search reveals that the council district are electoral 
+  divisions within the city. There are 51 city council districts
+  across the 5 boroughs. Each of these is responsible for dictating 
+  legislation in their respective areas. Council districts and 
+  community board regions of influence overlap. Members of the council 
+  district which overlaps with a community district area will help to 
+  select members for the community board of that district.
++ `CENSUS TRACT`: The census tract where the inspection was performed. 
++ `BIN`: This is a building identification
+  number provided for each building in New York city.
++ `NTA`: Neighborhood tabulation areas which are used for aggregating 
+  statistical information about neighborhood-level demographic and 
+  socioeconomic census data.
++ `City Council Districts`: It appears that the city council district 
+  associated with a given area is labeled differently from the district
+  itself. The same is the case with the `Community Districts` variable
+  which seems to be labeled differently from the `COMMUNITY BOARD` 
+  variable which (from my research) seem to be directly associated. 
++ `Borough Boundaries`: looking at the data itself, there seem to be a 
+  few distinct boundaries, or each borough borders a particular 
+  borough. TO check this, I check the unique borough boundary values 
+  for each borough, and plot the boroughs on a map. I use the shapely
+  and basemap files downloaded from the 
+  [New York OpenData site](https://data.cityofnewyork.us/Housing-Development/Shapefiles-and-base-map/2k7f-6s2k)
++ `zip_codes`: An extra column with zipcode data. We need to inspect 
+  whether or not this data is useful / valid. 
++ `Police Precints`: A number indicating one of the 77 distinct police
+  precints in new york city.
+
+Before we inspect the Borough boundaries, let's standardize the variable
+names for ease of use:
+
+```{python}
+# lower case all variable names
+inspect_dat.columns = inspect_dat.columns.str.lower()
+
+# replace all spaces in variable names with underscores
+inspect_dat.columns = inspect_dat.columns.str.replace(' ', '_')
+```
+
+Find boundaries associated with each borough 
+
+```{python}
+# look at the groupings of boundaries
+inspect_dat.groupby("borough")["borough_boundaries"].unique()
+```
+
+Graph the basemap and boroughs of each point in the dataset
+
+```{{python}}
+# import the street map file
+shp_path = 'geo_export_8fa8b07e-9702-4e59-90fd-6a280b19a2a2.shp'
+street_map = gpd.read_file(
+                  'data/ny-shapefiles-base-map/{}'.format(shp_path)
+             )
+
+fig, ax = plt.subplots(figsize=(15,15))
+street_map.plot(ax=ax)
+```
+
+![street map of new york](imgs/output.png)
+
+We need to save this figure because it is far to big to be regenerated
+over and over:
+
+```{{python}}
+plt.savefig("base_map.svg", format="svg")
+```
+
+Let's also plot an overlay of the borough points
+with a simplified geopandas dataframe (this improves plotting 
+speeds and reduces the resolution of the plot)
+
+```{{python}}
+simpl_street_map = street_map.simplify(tolerance=0.005)
+```
+
+Now that the data has been simplified, let's plot it again with overlays
+of the points from our `inspect_dat` dataframe. 
+
+```{{python}}
+# get the points and organize them in a new dataframe
+crs = {'init':'epsg:4326'}
+geoms = [Point(xy) for xy in zip(inspect_dat["longitude"],
+                                 inspect_dat["latitude"])]
+geo_inspect_dat = gpd.GeoDataFrame(inspect_dat, 
+                                   crs=crs,
+                                   geometry=geoms)
+
+# filter null location points
+geo_inspect_dat = geo_inspect_dat[~(
+                          (geo_inspect_dat.geometry.x == 0) & 
+                          (geo_inspect_dat.geometry.y == 0)
+                  )]
+
+# plot the geodataframe
+fig, ax = plt.subplots(figsize=(15,15))
+simpl_street_map.plot(ax=ax)
+geo_inspect_dat.plot(ax=ax,
+                     markersize=0.1, 
+                     alpha=0.4, 
+                     column='borough', 
+                     legend=True)
+plt.legend(prop={'size':15})
+```
+
+![map overlay](imgs/overlay_map.png)
+
+It's not obvious from these plots what the boundaries are referring 
+to specifically. I won't make any assumptions about that here. 
+
+To answer the original question of this prompt, the data 
+dictionary indicates that the `ZIP_CODE` variable corresponds to the 
+inspection location.
+
+**Summarizing Missing Information**
+
+As was done in a previous homework assignment, we can summarize the 
+missing information in the inspection data as follows:
+
+```{python}
+def summarize_na(dat):
+  '''
+  take as input a datframe and summarize missingness for all 
+  columns in said dataframe
+  '''
+  count_na = dat[[col for col in dat.columns]].isna().sum()
+  count_na = count_na.to_frame(name="na count")
+
+  # get na counts as a proportion of total records
+  count_na["prop na"] = count_na["na count"]/dat.shape[0]
+
+  # create a separate column for the variables (columns)
+  count_na = count_na.reset_index()
+
+  no_na = count_na.loc[count_na["na count"] == 0, "index"]
+  count_na = count_na.drop(count_na[count_na["na count"] == 0].index)
+
+  # get the 1st, 2nd, and 3rd quantile values
+  quantiles = np.array(count_na["na count"].quantile([0.25, 0.5, 0.75]))
+
+  # separate data into categories according to their quantile
+  count_na.loc[count_na["na count"] < quantiles[0], "na amount"] = "low"
+  count_na.loc[(count_na["na count"] >= quantiles[0]) & 
+               (count_na["na count"] < quantiles[1]),"na amount"] = "low-mid"
+  count_na.loc[(count_na["na count"] >= quantiles[1]) & 
+               (count_na["na count"] < quantiles[2]),"na amount"] = "high-mid"
+  count_na.loc[(count_na["na count"] >= quantiles[2]),"na amount"] = "high"
+  
+  # return the missing summary dataframe
+  return count_na
+
+summarize_na(inspect_dat)
+```
+
+Looking at the table of null values, we can see that some of the 
+longitude and latitude data points may be filled by using a 
+geocoder - we can tell that there are missing `latitude` and `longitude`
+values for which there is `zip_code` data provided since there are 
+more missing `latitude` and `longitude` records than there are missing
+`zip_code` data points. However, it may also be the case that 
+filled `latitude` and `longitude` values can be used to fill `zip_code`
+data. 
+
+First, let's use the zipcode data to try and fill in any missing 
+latitude and longitude data
+
+```{python}
+missing_coords = inspect_dat.loc[inspect_dat["latitude"].isna() | 
+                                 inspect_dat["longitude"].isna()]
+missing_coords = missing_coords.dropna(subset=["zip_code"])
+missing_coords[["zip_code", "longitude", "latitude"]]
+```
+
+Now take all of the zip codes, and use the search engine from 
+`uszipcode` to fill all of the longitude and latitude data
+
+```{{python}}
+# initialize zip code search engine
+search = SearchEngine()
+
+# iterate through unique zip codes and use them to fill 
+# missing longitude and latitude data
+for uniq_zip in missing_coords["zip_code"].unique():
+  result = search.by_zipcode(uniq_zip)
+
+  # skip missing cases
+  if result is None: continue
+
+  lat = result.lat
+  lng = result.lng
+
+  # fill missing values
+  inspect_dat.loc[inspect_dat["zip_code"] == uniq_zip, "latitude"] = lat
+  inspect_dat.loc[insepct_dat["zip_code"] == uniq_zip, "longitude"] = lng
+```
+
+This method of trying to obtain the missing latitude data didn't 
+seem to work. However, we can use the `geocoders` package
+to try and fill in this information instead. 
+
+```{python}
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+
+geolocator = Nominatim(user_agent="Yoshi234")
+
+def get_zip(lat, lon):
+  location = geolocator.reverse((lat, lon), exactly_one=True, 
+                                timeout=100)
+  # catch null return values
+  if location is None: return np.nan
+
+  address = location.raw.get("address", {})
+  zip_code = address.get("postcode")
+  return zip_code
+
+def get_lat_lng(zip_val):
+  location = geolocator.geocode(zip_val)
+  return location.longitude, location.latitude
+```
+
+Fill in missing latitude and longitude data
+
+```{{python}}
+for uniq_zip in missing_coords["zip_code"].unique():
+  lng, lat = get_lat_lng(uniq_zip)
+
+  # fill missing values
+  inspect_dat.loc[inspect_dat["zip_code"] == uniq_zip, "latitude"] = lat
+  inspect_dat.loc[inspect_dat["zip_code"] == uniq_zip, "longitude"] = lng
+```
+
+After using geopy to encode the missing coordinate values, the number
+of missing coordinate values is reduced considerably.
+It is important to note that some of these latitude and longitude values
+are 0's though. We should remove these points as well since they don't
+make any sense within the context of the data:
+
+```{python}
+zero_coords = inspect_dat.loc[(inspect_dat['latitude'] == 0) | 
+                (inspect_dat['longitude'] == 0)]
+summarize_na(zero_coords)
+```
+
+As you can see, in every case where coordinate value returned by 
+`geopy` is $(0,0)$ the `zip_code` value is null. We can attempt to 
+find some of these missing zipcode values however for coordinates 
+which are non-zero.
+
+```{python}
+missing_zips = inspect_dat.loc[(inspect_dat["zip_code"].isna()) & 
+                               (inspect_dat["longitude"] != 0) & 
+                               (inspect_dat["latitude"] != 0)]
+missing_zips = missing_zips.dropna(subset=["latitude", "longitude"])
+missing_zips[["zip_code", "longitude", "latitude"]]
+```
+
+It seems that (as we may have suspected) every time the zip code is 
+missing, the latitude and longitude are simply given as $(0,0)$. Thus, we 
+can't use the coordinates to fill in any missing zip codes.
+
+Alternatively, we may be able to fill missing latitude and longitude and 
+zip code values using the x and y coordinate values:
+
+```{python}
+inspect_dat.loc[((inspect_dat["zip_code"].isna()) |
+                 (inspect_dat["zip_code"] == 0)) & 
+                (inspect_dat["x_coord"].notnull()) & 
+                (inspect_dat["y_coord"].notnull()), 
+                ["zip_code",
+                 "x_coord", 
+                 "y_coord", 
+                 "latitude", 
+                 "longitude"]]
+```
+
+It looks like there are 357 records which we can use the x and y 
+coordinate values to fill in latitude, longitude, and zip code 
+data. We can use the pyproj package to try and fill in these missing
+values (convert new york system coordinates to latitude and longitude
+data)
+
+<!--
+NOTE: clean this up after using the subway location information
+# # Read your data (subways_loc.csv in this example)
+# subways_loc = pd.read_csv('subways_loc.csv')
+
+# Define the coordinate systems
+
+# # Convert x, y pairs to latitude and longitude
+# subways_loc['longitude'], subways_loc['latitude'] = pyproj.transform
+# (NAD83_LI, WGS84, subways_loc['x'].values, subways_loc['y'].values)
+
+# # View the updated DataFrame
+# print(subways_loc[['x', 'y', 'latitude', 'longitude']])
+-->
+
+```{{python}}
+import pyproj
+
+# New York State Plane Long Island
+NAD83_LI = pyproj.Proj(init='EPSG:32118')  
+
+# WGS-84 (latitude and longitude)
+WGS84 = pyproj.Proj(init='EPSG:4326')
+
+subset = inspect_dat.loc[(inspect_dat["zip_code"].isna()) & 
+                         (inspect_dat["x_coord"].notnull()) & 
+                         (inspect_dat["y_coord"].notnull())]
+
+subset['lat'], subset['lng'] = pyproj.transform(
+                                  NAD83_LI, 
+                                  WGS84, 
+                                  subset["x_coord"].values, 
+                                  subset["y_coord"].values
+                                )
+n = len(subset)
+count = 0
+
+for index, row in subset.iterrows():
+  count += 1
+  print(count/n)
+  inspect_dat.loc[(inspect_dat["x_coord"] == row["x_coord"]) & 
+                  (inspect_dat["y_coord"] == row["y_coord"]), 
+                  "longitude"] = row['lng']
+  inspect_dat.loc[(inspect_dat["x_coord"] == row["x_coord"]) & 
+                  (inspect_dat["y_coord"] == row["y_coord"]), 
+                  "latitude"] = row['lat']
+  inspect_dat.loc[(inspect_dat["x_coord"] == row["x_coord"]) & 
+                  (inspect_dat["y_coord"] == row["y_coord"]),
+                  "zip_code"] = get_zip(row['lat'], row['lng'])
+```
+
+Now we have finished filling in all of the zip code, latitude, and 
+longitudinal data as much as is reasonable. You can see that the 
+missing data points for longitude and latitude in particular have 
+been filled adequately. The `zip_code` variable may have additional 
+null values since the associated zip code could not be determined from 
+the x and y coordinate information (it replaced 0 values).
+
+We can also fill in the missing values for the `BBL` variable but this is 
+unecessary since we can simply use the `BOROCODE`, `BLOCK`, and 
+`LOT`variables to extract the same information. 
+
+**Variable Cleanup and Redundancy**
+
+We already know that the zip code variables are redundant, so we can 
+simply eliminate those. Additionally, we know that the bbl values are 
+embedded in the `BOROCODE`, `BLOCK`, and `LOT` variables already, so 
+we can simply eliminate this value. Additionally, it seems there are 
+no variables with an extreme number of missing values, so there are no 
+variables which should be dropped on that account alone. The location 
+variable is also redundant since the latitude and longitude data
+is also provided separately. Additionally, the x and y coordinate
+data which we used to fill some zipcode data is actually mostly 
+empty. Thus, we can eliminate this data as well.
+
+```{python}
+inspect_dat = inspect_dat.drop(["bbl", "zip_codes", "location",
+                                "x_coord", "y_coord"], axis=1)
+```
+
+Let's also use the `uszipcode` package to search for any zipcodes
+which might be invalid - we should remove these as well since they 
+won't be usable for later modeling.
+
+```{{python}}
+# drop any records with null zipcode values
+inspect_dat = inspect_dat.dropna(subset=['zip_code'])
+
+# get rid of all records with invalid zip codes
+for zip_val in inspect_dat["zip_code"].unique():
+  x = search.by_zipcode(int(zip))
+
+  # if the result is not a SimpleZipcode object, remove the associated
+  # zipcode value
+  if not isinstance(x, SimpleZipcode):
+    inspect_dat = inspect_dat.loc[inspect_dat['zip_code'] != zip_val]
+    continue
+
+  # if the zipcode is not in New York, remove it 
+  if not x.state == 'NY':
+    inspect_dat = inspect_dat.loc[inspect_dat['zip_code'] != zip_val]
+    continue
+```
+
+We will also need to remove any rows with missing borough information
+since we can't directly fill it with the uszipcode search. Additionally,
+only three of the ~400,000 records have invalid boroughs, so this won't 
+have a significant effect upon our analysis.
+
+```{python}
+inspect_dat = inspect_dat.dropna(subset=['borough'])
+```
+
+Let's review the missingness of the data again:
+
+```{python}
+inspect_dat_clean = pd.read_feather("data/rodent_inspection_2022-2023.feather")
+summarize_na(inspect_dat_clean)
+```
+
+As you can see much of the missingness from previous inspections have been
+removed. Some missingness remains for other variables, but this is 
+minimal. Additionally, this cleaning process only removed 3988 of the 
+407,186 meaningfull records from our dataset
+
+Now that the data is clean, let's save it and use it for analysis:
+
+```{{python}}
+# save the shrunken dataset
+inspect_dat.to_feather("data/rodent_inspection_2022-2023.feather")
+```
+
+Now we can compare the storage efficiency of the two data files:
+
+```{bash}
+ls -l data
+```
+
+*terminal output - extra output is omitted*
+
+```default
+-... 109351985 ... rodent_inspection_2022-2023.csv
+-... 47475402 ... rodent_inspection_2022-2023.feather
+```
+
+As you can see from the output, the original csv data file stored 
+109,351,985 bytes (109.35 MB) where as the feather file only requires
+47,650,002 bytes (47.65 MB). This saves 2.29 times more storage 
+than the csv format. 
+
+## Data Exploration
+
+**Problem Statement**
+
++ Create a binary variable `passing` indicating passing or not for the
+  inspection result. Does `passing` depend on whether the inspection is 
+  initial or compliance? State your hypothesis and summarize your test
+  result. 
++ Are passing patterns different across different boroughs for 
+  initial inspections? How about compliance inspections? State your
+  hypothesis and summarize your test results. 
++ If we suspect that the passing rate may depend on the time of day of 
+  the inspection, we may compare the passing rates for inspections done
+  in the mornings and inspections one in the afternoons. Visualize the 
+  comparison by borough and inspection type. 
++ Perform a formal hypothesis test to confirm the observations from 
+  your visualization. 
+
+**Inspection passing and dependence on type of inspection**
+
+Create the `passing` binary response variable
+
+```{python}
+inspect_dat_clean.loc[inspect_dat_clean["result"]=="Passed", 
+                      "passing"] = int(1)
+inspect_dat_clean.loc[inspect_dat_clean["result"]!="Passed",
+                      "passing"] = int(0)
+
+# convert the binary variable to an object type for plotting purposes
+inspect_dat_clean.loc[inspect_dat_clean["passing"] == 1,
+                      "plot_passing"] = "passed"
+inspect_dat_clean.loc[inspect_dat_clean["passing"] == 0,
+                      "plot_passing"] = "failed"
+```
+
+Plot the response variable as a bar-chart
+
+```{python}
+(ggplot(inspect_dat_clean, aes(x="inspection_type", fill="plot_passing"))
+  + geom_bar()
+  + ggtitle("Passing Inspections")
+  + xlab("Inspection Type")
+  + ylab("Number of passing inspections"))
+```
+
+As you can see from the plot, initial inspections demonstrated a higher
+rate of passing inspections than did compliance inspections. This 
+makes sense given that we know compliance inspections are only 
+performed if the initial inspection for that same location failed 
+the first time. We can test this dependency more explicitly with 
+a chi-squared test of independence.
+
+The hypotheses for this test ($\alpha=0.05$) are as follows:
+
+\[
+\begin{align*}
+& H_{0}: \text{Rodent inspection type and passing of inspection are independent} \\
+& H_{1}: H_{0} \text{ is false.}
+\end{align*}
+\]
+
+
+First, create the contingency table for this test
+
+```{python}
+contingency_table = pd.crosstab(inspect_dat_clean["passing"], 
+                                inspect_dat_clean["inspection_type"])
+contingency_table
+```
+
+Then use `scipy.stats` to perform the chi-squared test
+
+```{python}
+chi2_val, p, dof, expected = chi2_contingency(contingency_table)
+
+pd.Series({
+  "Chi-Squared Statistic": chi2_val, 
+  "p-value": p, 
+  "Degrees of Freedom": dof
+})
+```
+
+Seeing as the p-value of this test is virtually 0, we can conclude that
+the passing rate is dependent upon the inspection type performed.
+
+**Passing Patterns Across Different Boroughs**
+
+We can investigate whether or not the passing rate for initial 
+inspections differs across boroughs by creating stacked bar
+plots. (basically, we are investigating a potential dependency
+relationship between the inspection passing rate and the borough)
+
+We can see the side-by-side proportions as follows:
+
+```{python}
+fill_colors = ['red', '#00BA42']
+
+(ggplot(inspect_dat_clean.loc[inspect_dat_clean["inspection_type"] == 
+                                                "Initial"], 
+        aes(x='borough', fill='plot_passing'))
+    + geom_bar(position="fill")
+    + ggtitle("Initial Inspection Passing Rates by Borough")
+    + xlab("Borough")
+    + ylab("Inspections Result Proportions")
+    + scale_fill_manual(values=fill_colors)
+)
+```
+
+We can also plot the stacked bar plot of counts as well:
+
+```{python}
+fill_colors = ['red', '#00BA42']
+
+(ggplot(inspect_dat_clean.loc[inspect_dat_clean["inspection_type"] == 
+                                                "Initial"],
+        aes(x="borough", fill="plot_passing"))
+      + geom_bar()
+      + ggtitle("Initial Inspection Passing Counts by Borough")
+      + xlab("Borough")
+      + ylab("Inspections Result Proportions")
+      + scale_fill_manual(values=fill_colors)
+)
+```
+
+We can also examine the proportion of passing initial inspections
+grouped by the Borough:
+
+```{python}
+initial_inspections = inspect_dat_clean.loc[
+                        inspect_dat_clean["inspection_type"] == "Initial"
+                      ]
+inspections_dict = dict()
+for borough in initial_inspections["borough"].unique():
+  passing = initial_inspections.loc[
+                    (initial_inspections["borough"] == borough), 
+                    "passing"  
+            ]
+  prop_passing = passing.sum()/passing.shape[0]
+  inspections_dict[borough] = prop_passing
+
+inspections_dict
+```
+
+As you can see from the inspections dictionary, the initial inspection 
+passing rate does vary to a reasonable extent across different boroughs. 
+Namely, the Bronx, Manhattan, and Brooklyn all have an initial 
+inspection passing rate of $0.7$ or higher, while Staten Island 
+has a passing rate of $0.66$ and Queens a passing rate of $0.522$
+
+Our hypotheses for testing this relationship are as follows:
+
+\[
+\begin{align*}
+& H_{0}: \text{Borough where initial inspection was conducted and passing of inspection are independent} \\
+& H_{1}: H_{0} \text{ is false.}
+\end{align*}
+\]
+
+Construct the contingency table
+
+```{python}
+contingency_table = pd.crosstab(initial_inspections["passing"], 
+                                initial_inspections["borough"])
+contingency_table
+```
+
+And conduct the hypothesis test:
+
+```{python}
+chi2_val, p, dof, expected = chi2_contingency(contingency_table)
+
+pd.Series({
+  "Chi-Squared Statistic": chi2_val, 
+  "p-value": p, 
+  "Degrees of Freedom": dof
+})
+```
+
+Since the p-value of this test is less than our specified significance
+level of $0.05$, we can conclude that there is a significant dependency
+relationship between the borough where the initial rat inspection 
+was conducted and whether or not the inspection was passing. In 
+other words, the passing rate for initial inspections did differ 
+across different boroughs.
+
+**Analyze Inspection Passing Rates by Time (Morning or Afternoon)**
+
+In order to see whether the time of day (morning or afternoon) has an 
+effect upon the passing rate of initial inspections, we need to create 
+a binary variable indicating whether the time of the inspection was in 
+the morning or afternoon
+
+```{python}
+# conver the date columns to datetime format from strings
+inspect_dat_clean["inspection_date"]= pd.to_datetime(inspect_dat_clean[
+                                          "inspection_date"
+                                                     ], 
+                                           format="%m/%d/%Y %I:%M:%S %p",
+                                           errors='coerce'
+                                      )
+inspect_dat_clean["approved_date"]= pd.to_datetime(inspect_dat_clean[
+                                          "approved_date"
+                                                     ], 
+                                           format="%m/%d/%Y %I:%M:%S %p",
+                                           errors='coerce'
+                                      )
+
+# set new values for the hour
+inspect_dat_clean["hour_of_inspection"] = inspect_dat_clean[
+                                            "inspection_date"
+                                          ].dt.hour
+
+# set morning and afternoon labels
+inspect_dat_clean.loc[inspect_dat_clean["hour_of_inspection"] < 12,
+                      "morning"] = 1
+inspect_dat_clean.loc[inspect_dat_clean["hour_of_inspection"] >= 12 ,
+                      "morning"] = 0
+inspect_dat_clean.loc[inspect_dat_clean["morning"] == 0,
+                      "plot_time"] = "afternoon"
+inspect_dat_clean.loc[inspect_dat_clean["morning"] == 1,
+                      "plot_time"] = "morning"
+```
+
+Now that we have separated the time of the inspection into morning 
+and afternoon, we can generate a visualization to describe the 
+relavent relationships between inspection time, inspection type, 
+borough, and the passing rate. 
+
+```{python}
+# calculate proportions for groups
+fill_colors = ['red', '#00BA42']
+
+(ggplot(inspect_dat_clean, aes(x="plot_time",
+                               fill="plot_passing"))
+  + geom_bar(position="fill")
+  + facet_grid("inspection_type ~ borough")
+  + ylab("Inspection Passing Proportion")
+  + xlab("Inspection Time of Day")
+  + theme(axis_text_x=element_text(angle=50)) 
+  + scale_fill_manual(values=fill_colors)
+  + labs(fill = "Inspection Result")
+)
+```
+
+Based on our visualization, we can see that the proportion of 
+inspections which pass is almost always higher when the inspection 
+is performed in the afternoon (after 12pm) as compared to those which
+are performed in the morning. This trend seems consistent, however
+marginal, across different boroughs and inspection types. We can 
+confirm this observation with a chi-squared test of independence
+
+Our hypotheses to test at $\alpha=0.05$ significance level are 
+as follows:
+
+\[
+\begin{align*}
+& H_{0}: \text{The time of day when the inspection was conducted and passing of inspection are independent} \\
+& H_{1}: H_{0} \text{ is false.}
+\end{align*}
+\]
+
+Obtain the contingency table:
+
+```{python}
+contingency_table = pd.crosstab(inspect_dat_clean["plot_passing"], 
+                                inspect_dat_clean["plot_time"])
+contingency_table
+```
+
+Perform the chi-squared test of independence:
+
+```{python}
+chi2_val, p, dof, expected = chi2_contingency(contingency_table)
+
+pd.Series({
+  "Chi-Squared Statistic": chi2_val, 
+  "p-value": p, 
+  "Degrees of Freedom": dof
+})
+```
+
+The p-value for this test is less than our specified significance 
+level of $\alpha=0.05$, thus we can reject our null hypothesis
+in favor of the alternative and conclude that the inspection result is 
+dependent upon the time of day when said inspection was performed. 
+
+## Data Analytics
+
+**Problem Statement**
+
++ Aggregate the inspections by zip code to create a dataset with five
+  columns. The first three columns are `zipcode`; `n_initial`, the count
+  of the initial inspections in that zipcode; and `n_initpass`, the 
+  number of initial inspections with a passing result in that zipcode.
+  The other two variables are `n_compliance` and `n_comppass`, the
+  counterpart for compliance inspections. 
++ Add a variable to your dataset, `n_sighting`, which represent the 
+  number of rodent sightings from the 311 service request data in the 
+  same 2022-2023 period. 
++ Merge your dataset with the simple zipcode table in package `uszipcode`
+  by zipcode to obtain demographic and socioeconomic variables at the 
+  zipcode level. 
++ Build a binomial regression for the passing rate of initial inspections
+  at the zipcode level. Assess the goodness-of-fit of your model. 
+  Summarize your results to a New Yorker who is not data science 
+  savvy. 
+
+**Aggregate Inspection Data by zipcode**
+
+```{python}
+zip_dat = pd.DataFrame()
+
+# initialize all of the unique zip code data
+zip_dat["zipcode"] = inspect_dat_clean["zip_code"].unique()
+
+# get number of all initial inspections and those which passed
+for index, row in zip_dat.iterrows():
+  zip_val = row["zipcode"] 
+  
+  init_temp = inspect_dat_clean.loc[
+                    (inspect_dat_clean["zip_code"] == zip_val) & 
+                    (inspect_dat_clean["inspection_type"] == "Initial"),
+                    "passing"
+              ] 
+  comp_temp = inspect_dat_clean.loc[
+                    (inspect_dat_clean["zip_code"] == zip_val) & 
+                    (inspect_dat_clean["inspection_type"] == "Compliance"),
+                    "passing"
+              ]
+
+  # get number of initial inspections
+  zip_dat.loc[zip_dat["zipcode"]==zip_val,"n_initial"] = init_temp.shape[0]
+  
+  # get number of passing initial inspections
+  zip_dat.loc[zip_dat["zipcode"]==zip_val,"n_initpass"] = init_temp.sum()
+
+  # get number of compliance inspections
+  zip_dat.loc[zip_dat["zipcode"]==zip_val,"n_compliance"]=comp_temp.shape[0]
+  
+  # get number of passing compliance inspections
+  zip_dat.loc[zip_dat["zipcode"]==zip_val,"n_compass"] = comp_temp.sum()
+```
+
+We also want to add a `n_fail` variable (number of failing inspections)
+for the purpose of the statistical modeling which we will perform 
+later. 
+
+```{python}
+zip_dat["n_initfail"] = zip_dat["n_initial"] - zip_dat["n_initpass"]
+```
+
+**Get number of rodent sightings corresponding to zip codes**
+
+```{python}
+# read in the rodent sightings data
+rodent_sights = pd.read_feather("data/rodent_2022-2023.feather")
+
+for unique_zip in zip_dat["zipcode"].unique():
+  # get number of rodent sightings reported for each zipcode
+  zip_sightings = rodent_sights.loc[
+                      rodent_sights["incident_zip"]==unique_zip, 
+                  ].shape[0]
+
+  # integrate those values into the dataframe
+  zip_dat.loc[zip_dat["zipcode"]==unique_zip,"n_sightings"] = zip_sightings
+```
+
+**Merge data with simple zipcode table in the `uszipcode` package**
+
+```{python}
+# drop na zipcode from data
+zip_dat = zip_dat.dropna(subset=["zipcode"])
+
+# initialize search engine from uszipcode package
+search = SearchEngine()
+
+# create a table for all of the unique zip codes above
+for zipcode in zip_dat["zipcode"].unique():
+  simplezip = search.by_zipcode(int(zipcode))
+
+  if simplezip is None: continue
+  
+  # set all of the attributes associated with the zipcode
+  zip_dat.loc[zip_dat["zipcode"] == zipcode,
+                ["pop", 
+                 "pop_density",
+                 "land_area",
+                 "water_area",
+                 "housing_units",
+                 "occupied_units",
+                 "median_home_value",
+                 "median_household_income"]
+              ] = [
+                simplezip.population, 
+                simplezip.population_density,
+                simplezip.land_area_in_sqmi,
+                simplezip.water_area_in_sqmi,
+                simplezip.housing_units,
+                simplezip.occupied_housing_units,
+                simplezip.median_home_value,
+                simplezip.median_household_income
+              ]
+```
+
+There are some zipcodes in this list for which there is no 
+relevant demographic information:
+
+```{python}
+summarize_na(zip_dat)
+```
+
+Let's remove these columns with null values:
+
+```{python}
+zip_dat = zip_dat.dropna()
+
+# show there are no remaining null values in the data
+zip_dat.isna().sum()
+```
+
+**Binomial Regression Modeling for Initial Inspection Proportions**
+
+Here, we use Binomial Regression, or the general linear model with a
+logistic link function to estimate a binomially distributed response, 
+or the number of passing inspections for each. We can use the 
+`statsmodels.api` package to fit a binomial regression 
+model.
+
+Since we are trying to make a prediction about the passing rate of 
+inspections for a given area based on zipcode-associated demographic
+information, it doesn't really make sense to use the zipcode
+itself as a predictor. Instead, we should use associated variables
+which woul have been known in advance. These covariates inlcude 
+the population, the population density, the land area, the 
+water area, the number of housing units, the number of occuppied 
+units, the median home value, and the median household income.
+
+We also know from our exploratory analysis that there is a dependency
+relationship between the borough and the inspection passing rate. So
+I opt to include that data in this process (of coure, based on our 
+graphs it appears that only `Queens` will be a useful encoded 
+covariate, but we can account for that when we fit the model itself)
+
+```{python}
+# merge in the useful variables associated with zip codes
+zip_dat = zip_dat.merge(
+                inspect_dat_clean[["zip_code",
+                                   "borough"]].drop_duplicates(
+                                                subset="zip_code"
+                                               ),
+                left_on="zipcode",
+                right_on="zip_code",
+                how="left")
+
+# drop extra zipcode column from the merge operation
+zip_dat = zip_dat.drop("zip_code", axis=1)
+```
+
+Split the data into a training and test set for evaluation. We will 
+also need to encode all of the categorical variables in our data
+at this point. 
+
+```{python}
+def fit_cat_encoding(df:pd.DataFrame, cat:str):
+    encoder = OneHotEncoder()
+    one_hot = encoder.fit_transform(df[[cat]])
+    feature_names = encoder.get_feature_names_out()
+    features = pd.DataFrame(one_hot.toarray(), columns=feature_names)
+    df_new = df.join(features)
+    df_new = df_new.drop([cat], axis=1)
+    return df_new
+```
+
+```{python}
+# set response as proportion variable
+zip_dat['prop_pass'] = zip_dat['n_initpass']/zip_dat['n_initial']
+
+import statsmodels.api as sm
+
+# # encode all of the categorical variables
+zip_dat = fit_cat_encoding(zip_dat, "borough")
+# zip_dat = zip_dat.dropna()
+
+# # drop all of the non-usable data (include the number of inspections
+# # in the data) 
+X = zip_dat.drop(["n_initpass","n_initfail","n_initial",
+                  "n_compliance", "n_compass",
+                  "zipcode", "prop_pass"], axis=1)
+
+# # set the response variable
+y = zip_dat[['n_initpass', 'n_initfail']]
+```
+
+Fit the binomial regression model with statsmodels. 
+
+```{python}
+dat_exog = sm.add_constant(X, prepend=False)
+dat_endog = y
+
+model = sm.GLM(dat_endog, dat_exog, family=sm.families.Binomial())
+bin_mod2 = model.fit()
+bin_mod2.summary()
+```
+
+We can also use a plot of the predicted values versus fitted values to 
+see how well the model fits the data
+
+```{python}
+# set results data as dataframe
+results = pd.DataFrame(
+    {"Predicted": bin_mod2.fittedvalues,
+     "Actual": zip_dat["prop_pass"]
+    }
+)
+
+# plot the fitted values versus predicted values
+(ggplot(results, aes(x="Predicted", y="Actual"))
+    + geom_point()
+    + scale_y_continuous(limits=[0,1])
+    + scale_x_continuous(limits=[0,1])
+    + geom_abline(intercept=0, slope=1, color="red"))
+```
+
+The fitted binomial regression model demonstrates a very poor fit. There
+are three primary metrics which are used in this regard: the
+log-likelihood function, the deviance, and the pearson chi-2 
+statistic. 
+
+Our goal should be to maximize the log-likelihood function. However, 
+this value is extremely low. Additionally, a significant chi2
+statistic, which $9,610$ certainly is, indicates that the model is 
+not fit well. All of these indicators point to a poor fit of the 
+model.
+
+As such, it would be difficult to draw any meaningful 
+conclusions about the significance of each variable towards the 
+likelihood of a passing inspection (passing inspection rates).
+
+However, we can still see which variables are the most predictively 
+useful by using `sklearn.feature_selection` package. We compute 
+the best features using the `f_classif` method which computes the 
+f-statistics of each covariate for predicting the response. In other
+words, the higher the returned score, the more significant the 
+predictor is towards predicting the response value.
+
+```{python}
+# feature selection
+from sklearn.feature_selection import SelectKBest, f_classif
+
+y_target = zip_dat["prop_pass"]
+
+test = SelectKBest(score_func=f_classif, k=4)
+fit = test.fit(X, y_target)
+
+# print(X.columns)
+features = fit.transform(X)
+# print(fit.scores_)
+
+#5, 6, 8, 10
+list(zip(X.columns, fit.scores_))
+```
+
+Here we can see that the **number of rodent sightings**, the **water**
+**area**, **number of housing units**, and the **number of occuppied units** 
+are the most significant towards predicting the number of inspections passed 
+at a given zip code. We can also see the relative importance of each 
+variable. In this case, the initial number of inspections was the
+strongest predictor of the number of passed inspections with the number of 
+rodent sightings a distant second place. 
+
+This makes sense to a certain extent given that we would expect a location 
+with a higher number of rodent sightings to also experience a lower 
+passing rate with respect to inspections. The number of occuppied units and
+housing units also make sense since we might expect more densely populated 
+areas, especially where buildings are old and not well maintained to be 
+more prone to rodent infestation as well. 
+
+<!-- 
+Analyzing the proportions provides another view into the importance
+of variables towards predicting the rate of passing rodent inspections:
+
+```
+X2 = zip_dat.drop(["zipcode", "n_initial", "n_initpass", 
+                   "n_compliance", "n_compass", "n_initfail", 
+                   "prop_pass"], axis=1)
+y2 = zip_dat["prop_pass"]
+
+select2 = SelectKBest(score_func=f_classif, k=4)
+fit = select2.fit(X2, y2)
+
+features = fit.transform(X2)
+
+list(zip(X2.columns, fit.scores_))
+```
+
+This evaluation demonstrates that the number of rodent sightings was 
+the strongest predictor of a passing inspection, with the water area of the zip code following closely behind.  -->
+
+## Research Question 
+
+Now you know the data quite well. Come up with a research question of 
+interest that can be answered by the data, which could be analytics 
+or visualizations. Perform the needed analyses and answer your 
+question. 
+
+At the end of the day, the most important question to answer with this 
+project is "where are we most likely to run into rats?". This is an 
+important question to answer because it will enable tourists 
+to be more aware of rat hotspots, and inform governing agencies of where
+to invest additional resources in trying to combat the rat problem.
+
+To answer this question, we will create several heat 
+maps and overlay them with zip-code level maps of new york, 
+These will show the zip codes of areas with high levels of rat
+sightings (high likelihood of failing an initial rodent inspection) 
+as well as how the rates of inspection passing or failing, as well as
+the number of inspections performed across New York vary.
+
+```{python}
+# get the borough data back into the zip_dat dataframe
+zip_dat = zip_dat.merge(inspect_dat_clean[[
+                              "zip_code", "borough"
+                        ]].drop_duplicates(subset="zip_code"),
+                        left_on="zipcode", 
+                        right_on="zip_code")
+
+zip_dat["zipcode"] = zip_dat["zipcode"].astype("float64")
+zipcodes = gpd.read_file("data/nyc_zipcodes.geojson")
+zipcodes.set_crs("EPSG:4326")
+
+# convert the zipcode value into a float to match the 
+# zip_dat column
+zipcodes["ZIPCODE"] = zipcodes["ZIPCODE"].astype("float64")
+
+zipcodes = zipcodes.merge(zip_dat,
+                          left_on="ZIPCODE", 
+                          right_on="zipcode")
+zipcodes.head(1).T
+```
+
+```{python}
+# drop all unecessary variables from the data frame to simplify the 
+# key used
+zipcodes2 = zipcodes[["geometry", "zipcode","borough", "COUNTY",  
+                      "n_initial", "n_initfail",
+                      "n_compass", "n_initpass", 
+                      "n_compliance", "pop", "pop_density", 
+                      "median_home_value", "median_household_income",
+                      "prop_pass", "n_sightings"]]
+
+ax = zipcodes2.plot(column="n_initfail", legend=True)
+ax.set_title("Number of Failed Initial Inspections by Zip Code")
+plt.show()
+```
+
+Plot a log-scale inference
+
+```{python}
+zipcodes2['log failures'] = np.log1p(zipcodes['n_initfail'])
+ax = zipcodes2.plot(column='log failures', legend=True)
+ax.set_title("Log Number of Failed Initial Inspections by Zip Code")
+plt.show()
+```
+
+This map provides a very clear picture of the locations where the 
+majority of rat inspections are failing. However, it is also important
+to note that this area may have a higher number of inspections
+performed to begin with. We can examine this by checking the number
+of inspections performed at each zipcode:
+
+```{python}
+ax = zipcodes2.plot(column="n_initial", legend=True)
+ax.set_title("Number of Initial Inspections by Zip Code")
+plt.show()
+```
+
+This graph paints much the same picture as the previous one. Perhaps
+a more fair comparison of inspection passing rates would be to compare
+the inspection passing proportions: 
+
+```{python}
+ax = zipcodes2.plot(column="prop_pass", legend=True)
+ax.set_title("Proportion of passed inspections by Zip Code")
+plt.show()
+```
+
+This graph indicates a very different answer to our question than 
+the previous ones. Namely, it demonstrates that although rodent 
+inspections occurred with greater frequency further south, initial 
+inspections passed at a much lower rate further north towards the north
+west of queens along the river.
+
+Another cluster of low passing rates also appeared towards the 
+south of queens towards long island. Additionally, clusters of low
+passing inspection rates occurred at the northern tip of 
+staten island, as well as the northwestern part of the bronx, 
+specifically at zip code 10471.
+
+According to nyc.gov [7], rodent inspections are filed primarily in 
+response to 311 service requests and as part of proactive efforts
+towards the neighborhood rat indexing program, which aims to understand
+the regions of most significant rat activity [6].
+
+We can examine the rat sightings as part of this data to see if it 
+overlaps with the number of rat inspections performed which we saw
+in previous graphs: 
+
+```{python}
+ax = zipcodes2.plot(column="n_sightings", legend=True) 
+ax.set_title("Number of Rodent Sightings by Zip Code")
+plt.show()
+```
+
+Log rodent-sightings
+
+```{python}
+zipcodes2['log sightings'] = np.log1p(zipcodes2['n_sightings'])
+zipcodes2.explore(column='log sightings', legend=True)
+```
+
+Although the median household income was a significant predictor according
+to our binomial regression model, we may be able to identify a 
+spatially dependent correlation:
+
+```{python}
+zipcodes2['inv_income'] = 1/zipcodes2['median_household_income']
+ax = zipcodes2.plot(column='inv_income', legend=True)
+ax.set_title('(Reciprocal) Median Household Income by Zip Code')
+plt.show()
+```
+
+It seems that there is some overlap between the most significant 
+rodent sightings locations, and areas with a lower median household
+income. We can investigate whether this trend holds true for 
+median home prices as well:
+
+```{python}
+zipcodes2['inv_home'] = 1/zipcodes2['median_home_value']
+ax = zipcodes2.plot(column='inv_home', legend=True)
+ax.set_title('(Reciprocal) Median Home Value by Zip Code')
+plt.show()
+```
+
+The connection between home prices and rodent sightings in this 
+case is not nearly as clear.
+
+Let us now create a variable which explores the ratio of rat sightings
+to the number of inspections which are performed. This may help us to 
+visualize the effect that rat sightings has upon the number of 
+inspections performed at different locations.
+
+```{python}
+# find the ratio of inspections to sightings reported
+zipcodes2["inspect_prop"] = zipcodes2["n_initial"]/zipcodes2["n_sightings"]
+
+ax = zipcodes2.plot(column="inspect_prop", legend=True)
+ax.set_title("Ratio of Num Inspections to Sightings by Zip Code")
+plt.show()
+```
+
+Show the log of rodent sightings to inspections conducted by zipcode
+
+```{python}
+zipcodes2['log_sight_to_inspect'] = np.log1p(zipcodes2['inspect_prop'])
+zipcodes2.explore(column='log_sight_to_inspect')
+```
+
+Looking at the graph, this actually shows us where rat inspections 
+may actually be over-indexed, while others are not inspected enough.
+This would require further information.
+to verify however. Specifically, it would be useful to understand
+the strategies behind the rodent indexation program in New York. 
+
+We can get a better picture of which areas are under-indexed for rat
+inspections by taking the reciprocal of the proportions. This 
+will highlight underindexed areas.
+
+```{python}
+zipcodes2["recip_inspect_prop"] = 1/zipcodes2["inspect_prop"]
+ax = zipcodes2.plot(column="recip_inspect_prop",legend=True)
+ax.set_title("Inverse of Inspections to Sightings Ratio by Zip Code")
+plt.show()
+```
+
+On this map, areas in bright yellow indicate regions which have 
+reported higher levels of rodent sightings relative to the number 
+of inspections which were performed. We can see that two such 
+areas are in the northeastern and northwestern corners of the bronx
+which lie next to zipcodes which are actually over inspected relative
+to the number of rodent sightings which occurred in that area.
+
+We can also see that there are areas in the south west of 
+Brooklyn which are also under-inspected (relative to the number
+of reported rodent complaints).
+
+The last important variable to consider is the passing rate and 
+counts of compliance inspections. These failed compliance inspections
+indicate where rat issues have persisted and are perhaps severe:
+
+```{python}
+ax = zipcodes2.plot(column="n_compliance", legend=True)
+ax.set_title("Number of Compliance Inspections Performed by Zip Code")
+plt.show()
+```
+
+This map closely mirrors the map of initial inspections, showing that
+the region in the northeast of the Bronx bordering Queens requires
+a high level of follow up inspections. This makes sense since a high
+number of initial inspections were conducted here in the first place.
+
+Failed compliance inspection rates appear as follows on the map:
+
+```{python}
+zipcodes2["prop_comp_pass"] = zipcodes2["n_compass"]/zipcodes2["n_compliance"]
+ax = zipcodes2.plot(column="prop_comp_pass", legend=True)
+ax.set_title("Proportion of Compliance Inspections Passed by Zip Code")
+plt.show
+```
+
+For the most part, compliance inspections failed at an average rate of 
+$0.435$. However, a few areas demonstrated particularly high and low
+failing inspection rates. In the case of high passing rates, the 
+number of inspections seemed to be quite low. 
+
+These graphs and data can be aggregated to determine the areas which 
+require the most attention with regards to rodent population 
+mitigation, and which areas tourists may want to avoid when visiting. 
+It seems that the most reliable metric to use when deciding which areas
+to avoid is the number of rodent sightings which occur. This is 
+relavent to visitors in particular who will only need to avoid, not 
+deal with the infestation issues (often uncoverable through inspection).
+Thus, viewing an exploration of the rodent sightings grouped by zipcodes
+shows that Randals and Wards Islands near Harlem have demonstrated 
+the highest absolute number of rodent sightings. 
+
+![](imgs/sightings_explore1.png)
+
+Central Park West also indicated a higher level of rodent sightings
+
+![](imgs/sightings_explore3.png)
+
+Brooklyn's Crypress Hills Cemetery and surrounding areas to the west 
+also demonstrated above average number of rodent sightings. 
+
+![](imgs/sightings_explore2.png)
+
+Given that all of the major hot spots for rodent activity occurred close
+to open areas (parks or cemeteries), it is reasonable to conclude 
+that such open spaces still play a major role in rat populations as they
+did in the 2014 study conducted by Walsh.
+
+
+
+
+## References
+
+1. Plotting with `geopandas` and `contextily`: 
+   [stackoverflow](https://stackoverflow.com/questions/63644131/how-to-use-geopandas-to-plot-latitude-and-longitude-on-a-more-detailed-map-with)
+2. Using geopandas and basemap files for graphing maps: 
+   [towardsdatascience.com](https://towardsdatascience.com/geopandas-101-plot-any-data-with-a-latitude-and-longitude-on-a-map-98e01944b972)
+3. Binomial Regression Modeling: [Purdue University](https://www.stat.purdue.edu/~fmliang/STAT512/lect12.pdf)
+4. Statsmodels Documentation: [statsmodels.org](https://www.statsmodels.org/stable/generated/statsmodels.genmod.families.family.Binomial.html#statsmodels.genmod.families.family.Binomial)
+5. Fitting a binomial counts regression with formula in statsmodels: 
+   [stackoverflow.com](https://stackoverflow.com/questions/76042312/performing-binomial-not-just-binary-regression-in-python-statsmodels#:~:text=statsmodels%20can%20do%20that.%20The%20correct,syntax%20is%20smf.glm%28%27succ%2Fsucc%2Bfail%20~%20x%27%2C%20tbTest%2C%20family%3Dbinom%29.fit%28%29)
+6. Rat Indexing Initatives in New York: [nyc.gov](https://www.nyc.gov/site/doh/health/health-topics/rat-maps-and-data-rat-indexing.page)
+7. Rat Inspections: [nyc.gov](https://www.nyc.gov/site/doh/health/health-topics/rat-inspections.page)
+8. GeoFrame data exploration: [ids-s23](https://statds.github.io/ids-s23/geo.html)
+9. Using statsmodels to perform binomial regression: 
+   [statsmodels.org](https://www.statsmodels.org/dev/examples/notebooks/generated/glm.html)
+10. Matt G. Walsh on Rodent Sightings in New York [peerj](https://peerj.com/articles/533/)
+  
